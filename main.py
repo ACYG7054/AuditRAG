@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 from fastapi import FastAPI
+from pymilvus import MilvusClient
 
 app = FastAPI()
 
@@ -12,6 +15,57 @@ async def root():
 async def say_hello(name: str):
     return {"message": f"Hello {name}"}
 
+MILVUS_URI = "http://192.168.17.30:19530"  # 改成你 VM5 的 IP
+COLLECTION = "demo_vectors"
+DIM = 4
+
+client: MilvusClient | None = None
+
+
+@app.on_event("startup")
+def startup():
+    global client
+    # 连接 Milvus（官方文档：默认端口 19530，使用 URI 连接）
+    client = MilvusClient(uri=MILVUS_URI)
+
+    # 若集合不存在则创建（用最小 schema：id + vector）
+    if not client.has_collection(COLLECTION):
+        client.create_collection(
+            collection_name=COLLECTION,
+            dimension=DIM,
+            # metric_type 可选：L2 / IP / COSINE，默认通常 L2（不同版本可能略有差异）
+        )
+
+
+@app.get("/milvus/ping")
+def milvus_ping():
+    # 简单检查：列出集合
+    cols = client.list_collections()
+    return {"ok": True, "collections": cols}
+
+
+@app.post("/milvus/insert")
+def milvus_insert():
+    # 插入两条向量
+    data = [
+        {"id": 1, "vector": [0.1, 0.2, 0.3, 0.4]},
+        {"id": 2, "vector": [0.11, 0.19, 0.29, 0.41]},
+    ]
+    res = client.insert(collection_name=COLLECTION, data=data)
+    return {"insert_result": res}
+
+
+@app.get("/milvus/search")
+def milvus_search():
+    # 搜索与 query 最相近的 top2
+    query_vec = [0.1, 0.2, 0.3, 0.4]
+    res = client.search(
+        collection_name=COLLECTION,
+        data=[query_vec],
+        limit=2,
+        output_fields=["id"],
+    )
+    return {"search_result": res}
 '''
 功能一：
 快速复用历史问题
