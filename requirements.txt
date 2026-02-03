@@ -1,0 +1,8 @@
+﻿llama-index-core
+llama-index-vector-stores-milvus
+llama-index-embeddings-dashscope
+dashscope
+pymilvus
+fastapi
+pydantic
+uvicorn
