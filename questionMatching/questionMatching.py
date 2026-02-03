@@ -61,6 +61,7 @@ SCALAR_FIELD_TYPES = [DataType.VARCHAR] * len(SCALAR_FIELDS)
 OUTPUT_FIELDS = [TEXT_FIELD] + SCALAR_FIELDS
 client: MilvusClient | None = None
 _index: VectorStoreIndex | None = None
+# 字段权重配置键（用于重排序层）
 FIELD_WEIGHT_KEYS = (
     "problem_type",
     "problem_nature",
@@ -68,6 +69,7 @@ FIELD_WEIGHT_KEYS = (
     "basis",
     "advice",
 )
+# 字段权重默认值（Mock Nacos 无配置或配置非法时使用）
 DEFAULT_FIELD_WEIGHTS: Dict[str, float] = {
     "problem_type": 0.1,
     "problem_nature": 0.1,
@@ -75,11 +77,15 @@ DEFAULT_FIELD_WEIGHTS: Dict[str, float] = {
     "basis": 0.25,
     "advice": 0.2,
 }
+# 字段权重缓存锁，防止并发读写冲突
 _field_weight_lock = threading.Lock()
+# 字段权重内存缓存，支持热更新
 _field_weight_config: Dict[str, float] = DEFAULT_FIELD_WEIGHTS.copy()
+# Nacos 监听器单例（Mock 版本）
 _nacos_listener: "NacosConfigListener | None" = None
 
 # 导入记录模型（来自消息或批量接口）
+# 导入记录模型（单条审计问题的数据结构）
 class ImportRecord(BaseModel):
     source_id: str = Field(..., min_length=1, max_length=64)
     problem_type: str = Field(..., min_length=1, max_length=64)
@@ -89,12 +95,14 @@ class ImportRecord(BaseModel):
     advice: str = Field(..., min_length=1, max_length=1024)
 
 # 导入请求（可带批量记录或按 batch_size 拉取）
+# 导入请求模型（支持批量记录或按 batch_size 拉取）
 class ImportRequest(BaseModel):
     batch_size: int = Field(100, ge=1, le=5000)
     records: Optional[List[ImportRecord]] = None
 
 
 # 检索请求参数
+# 检索请求模型（混合检索与重排控制参数）
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1)
     top_k: int = Field(10, ge=1, le=50)
@@ -106,6 +114,7 @@ class SearchRequest(BaseModel):
     filter_problem_type: Optional[str] = None
     filter_problem_nature: Optional[str] = None
 
+# 获取 LlamaIndex 索引实例，未初始化时抛 503
 def _get_index() -> VectorStoreIndex:
     # 索引未就绪时返回 503，避免空指针
     if _index is None:
@@ -114,6 +123,7 @@ def _get_index() -> VectorStoreIndex:
 
 
 
+# 构建元数据过滤条件（按 source_id / problem_type / problem_nature）
 def _build_metadata_filters(req: SearchRequest) -> Optional[MetadataFilters]:
     # 根据请求条件构建元数据过滤器
     filters = []
@@ -127,18 +137,19 @@ def _build_metadata_filters(req: SearchRequest) -> Optional[MetadataFilters]:
         return None
     return MetadataFilters(filters=filters)
 
+# 规范化文本（清理首尾空白与多余空格）
 def _normalize_text(text: str) -> str:
     # 规整空白字符，避免空检索
     return " ".join(text.strip().split())
 
 
 def _get_config_path() -> Path:
-    # Use the root config.py as a mock Nacos config source.
+    # 读取根目录 config.py，作为 Mock Nacos 配置来源
     return Path(__file__).resolve().parents[1] / "config.py"
 
 
 def _normalize_weight_config(raw_config: Dict[str, Any]) -> Dict[str, float]:
-    # Normalize and validate field weights from config.
+    # 清洗并校验配置：缺失/非法值回退默认权重
     if not isinstance(raw_config, dict):
         return DEFAULT_FIELD_WEIGHTS.copy()
     raw_weights = raw_config.get("weights", {})
@@ -156,20 +167,21 @@ def _normalize_weight_config(raw_config: Dict[str, Any]) -> Dict[str, float]:
 
 
 def _refresh_field_weights(raw_config: Dict[str, Any]) -> None:
-    # Update in-memory weights to simulate Nacos hot refresh.
+    # 刷新内存中的权重配置（线程安全）
     normalized = _normalize_weight_config(raw_config)
     with _field_weight_lock:
         _field_weight_config.update(normalized)
 
 
 def _get_field_weights() -> Dict[str, float]:
-    # Copy to avoid concurrent mutation.
+    # 对外返回权重副本，避免被外部修改
     with _field_weight_lock:
         return dict(_field_weight_config)
 
 
 class NacosConfigListener:
     def __init__(self, config_path: Path, poll_interval: float) -> None:
+        # 监听配置文件变更（Mock Nacos），支持轮询间隔配置
         self._config_path = config_path
         self._poll_interval = max(float(poll_interval), 0.5)
         self._stop_event = threading.Event()
@@ -177,6 +189,7 @@ class NacosConfigListener:
         self._last_mtime: Optional[float] = None
 
     def start(self) -> None:
+        # 启动后台线程，避免重复启动
         if self._thread and self._thread.is_alive():
             return
         self._thread = threading.Thread(
@@ -187,12 +200,14 @@ class NacosConfigListener:
         self._thread.start()
 
     def _run(self) -> None:
+        # 首次强制加载配置，后续按间隔轮询
         self._reload_if_needed(force=True)
         while not self._stop_event.is_set():
             time.sleep(self._poll_interval)
             self._reload_if_needed(force=False)
 
     def _reload_if_needed(self, force: bool) -> None:
+        # 文件变更检测：mtime 变化才触发 reload
         try:
             mtime = self._config_path.stat().st_mtime
         except OSError:
@@ -214,7 +229,7 @@ class NacosConfigListener:
 
 
 def _start_nacos_listener() -> None:
-    # Start a single background listener to simulate Nacos config updates.
+    # 启动 Mock Nacos 监听器，确保只启动一次
     global _nacos_listener
     if _nacos_listener is not None:
         _nacos_listener.start()
@@ -231,7 +246,7 @@ def _start_nacos_listener() -> None:
 
 
 def _to_char_bigrams(text: str) -> List[str]:
-    # Character bigrams handle both Chinese and Latin without extra dependencies.
+    # 字符二元组切分：兼容中文与英文，无需额外分词依赖
     if not text:
         return []
     if len(text) == 1:
@@ -240,7 +255,7 @@ def _to_char_bigrams(text: str) -> List[str]:
 
 
 def _field_similarity(query_text: str, field_text: str) -> float:
-    # Simple Jaccard similarity over character bigrams.
+    # 基于字符二元组的 Jaccard 相似度，用于字段匹配打分
     query = _normalize_text(query_text).replace(" ", "")
     field = _normalize_text(field_text).replace(" ", "")
     if not query or not field:
@@ -258,7 +273,7 @@ def _field_similarity(query_text: str, field_text: str) -> float:
 
 
 def _rerank_nodes(nodes: List[Any], query_text: str) -> List[Any]:
-    # Apply field-weight rerank based on mock Nacos config.
+    # 根据字段权重对候选结果重排序
     if not nodes:
         return nodes
     weights = _get_field_weights()
@@ -269,6 +284,7 @@ def _rerank_nodes(nodes: List[Any], query_text: str) -> List[Any]:
         return nodes
     scored: List[Tuple[float, Any]] = []
     for item in nodes:
+        # base_score 为检索得分，extra_score 为字段权重加成
         base_score = getattr(item, "score", 0.0) or 0.0
         node = getattr(item, "node", None)
         metadata = getattr(node, "metadata", {}) if node else {}
@@ -280,6 +296,7 @@ def _rerank_nodes(nodes: List[Any], query_text: str) -> List[Any]:
             extra_score += weight * _field_similarity(query, str(field_value))
         rerank_score = base_score + extra_score
         try:
+            # 写回 score，便于后续统一使用
             item.score = rerank_score
         except Exception:
             pass
@@ -288,11 +305,13 @@ def _rerank_nodes(nodes: List[Any], query_text: str) -> List[Any]:
     return [item for _, item in scored]
 
 
+# 拼接全文检索字段（用于稠密/稀疏混合检索）
 def _build_text_all(record: ImportRecord) -> str:
     # 拼接用于检索的全文字段
     return "\n".join([record.problem_desc, record.basis, record.advice])
 
 
+# Mock RocketMQ 拉取数据（本地调试用）
 def _mock_pull_from_rocketmq(batch_size: int) -> List[ImportRecord]:
     # 模拟从 RocketMQ 拉取数据（本地调试用）
     now = int(time.time())
@@ -311,13 +330,16 @@ def _mock_pull_from_rocketmq(batch_size: int) -> List[ImportRecord]:
     return records
 
 
+# 确保 Milvus 集合与索引存在
 def _ensure_collection() -> None:
     # 确保集合与索引存在
     milvus = _get_client()
+    # 集合已存在则直接加载
     if milvus.has_collection(COLLECTION_NAME):
         milvus.load_collection(COLLECTION_NAME)
         return
 
+    # 初始化集合 Schema
     # 创建集合 Schema
     schema = milvus.create_schema(
         auto_id=True,
@@ -411,6 +433,7 @@ def _ensure_collection() -> None:
         metric_type="BM25",
     )
 
+    # 创建集合并设置索引参数
     milvus.create_collection(
         collection_name=COLLECTION_NAME,
         schema=schema,
@@ -419,9 +442,11 @@ def _ensure_collection() -> None:
         shards_num=1,
         properties={"timezone": "Asia/Shanghai"},
     )
+    # 创建后立即加载集合
     milvus.load_collection(COLLECTION_NAME)
 
 
+# 获取 Milvus 客户端实例，未初始化时抛 503
 def _get_client() -> MilvusClient:
     # Milvus 客户端未就绪时返回 503
     if client is None:
@@ -429,6 +454,7 @@ def _get_client() -> MilvusClient:
     return client
 
 
+# 构建 DashScope 向量嵌入模型
 def _build_embed_model() -> DashScopeEmbedding:
     # DashScope 嵌入模型初始化
     if not DASHSCOPE_API_KEY:
@@ -436,6 +462,7 @@ def _build_embed_model() -> DashScopeEmbedding:
     return DashScopeEmbedding(api_key=DASHSCOPE_API_KEY, model_name=DASHSCOPE_EMBED_MODEL)
 
 
+# 构建 Milvus 向量存储（支持稠密/稀疏混合检索）
 def _build_vector_store(
     hybrid_ranker: str,
     hybrid_ranker_params: Optional[Dict[str, Any]],
@@ -472,6 +499,7 @@ def _build_vector_store(
     )
 
 
+# 构建默认索引（加权混合检索）
 def _build_default_index() -> VectorStoreIndex:
     # 默认使用加权混合检索
     vector_store = _build_vector_store(
@@ -482,6 +510,7 @@ def _build_default_index() -> VectorStoreIndex:
     return VectorStoreIndex.from_vector_store(vector_store, storage_context=storage_context)
 
 
+# 启动初始化：Milvus、集合、嵌入模型与索引
 def startup() -> None:
     # 初始化 Milvus、集合与 LlamaIndex
     global client, _index
@@ -489,9 +518,11 @@ def startup() -> None:
     _ensure_collection()
     Settings.embed_model = _build_embed_model()
     _index = _build_default_index()
+    # 启动配置监听，支持字段权重热更新
     _start_nacos_listener()
 
 
+# 导入审计问题数据（支持批量或 Mock 拉取）
 @router.post("/import")
 def import_from_rocketmq(req: ImportRequest) -> Dict[str, Any]:
     """导入审计问题（支持批量或模拟拉取）"""
@@ -500,8 +531,10 @@ def import_from_rocketmq(req: ImportRequest) -> Dict[str, Any]:
     if client is None or _index is None:
         startup()
 
+    # 获取导入数据来源（请求传入或 Mock 拉取）
     records = req.records if req.records else _mock_pull_from_rocketmq(req.batch_size)
     nodes: List[TextNode] = []
+    # 构建节点与元数据
     for record in records:
         text_all = _build_text_all(record)
         metadata = {
@@ -525,6 +558,7 @@ def import_from_rocketmq(req: ImportRequest) -> Dict[str, Any]:
     }
 
 
+# 混合检索入口（稠密 + 稀疏 + 重排）
 @router.post("/search")
 def search(req: SearchRequest) -> Dict[str, Any]:
     """混合检索（稠密 + 稀疏），必要时回退默认检索"""
@@ -537,6 +571,7 @@ def search(req: SearchRequest) -> Dict[str, Any]:
 
     filters = _build_metadata_filters(req)
 
+    # 根据开关选择融合策略（RRF 或加权）
     if req.use_rrf:
         hybrid_ranker = "RRFRanker"
         hybrid_ranker_params = {"k": 60}
@@ -551,6 +586,7 @@ def search(req: SearchRequest) -> Dict[str, Any]:
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
     index = VectorStoreIndex.from_vector_store(vector_store, storage_context=storage_context)
 
+    # 优先尝试混合检索，失败则回退默认检索
     try:
         retriever = index.as_retriever(
             vector_store_query_mode=VectorStoreQueryMode.HYBRID,
@@ -558,6 +594,7 @@ def search(req: SearchRequest) -> Dict[str, Any]:
             filters=filters,
         )
         nodes = retriever.retrieve(query_text)
+        # 字段权重重排（基于 Mock Nacos 配置）
         nodes = _rerank_nodes(nodes, query_text)
         results = _format_nodes(nodes, req.min_score)
         return {"ok": True, "count": len(results), "results": results, "hybrid": True}
@@ -568,6 +605,7 @@ def search(req: SearchRequest) -> Dict[str, Any]:
             filters=filters,
         )
         nodes = retriever.retrieve(query_text)
+        # 字段权重重排（基于 Mock Nacos 配置）
         nodes = _rerank_nodes(nodes, query_text)
         results = _format_nodes(nodes, req.min_score)
         return {
@@ -579,6 +617,7 @@ def search(req: SearchRequest) -> Dict[str, Any]:
         }
 
 
+# 格式化检索结果，并按 min_score 过滤
 def _format_nodes(
     nodes: List[Any],
     min_score: float,
